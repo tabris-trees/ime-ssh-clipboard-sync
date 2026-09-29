@@ -1,0 +1,16 @@
+# Local runtime data
+*.log
+ClipboardInbox/
+
+# Secrets and local SSH material
+config.psd1
+*.key
+*.pem
+id_ed25519
+id_ed25519.pub
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

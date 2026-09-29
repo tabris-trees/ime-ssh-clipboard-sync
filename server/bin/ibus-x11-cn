@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec "$HOME/tools/codex-ibus-x11/ibus-x11" cn

@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tool_root="$HOME/tools/codex-ibus-x11"
+# Never infer the display from a previous session's environment file.
+selected_display="${DISPLAY:-${CODEX_IBUS_DISPLAY:-}}"
+if [[ -z "$selected_display" ]]; then
+  echo "DISPLAY is not set. Connect with SSH X11 forwarding or explicitly set DISPLAY." >&2
+  exit 1
+fi
+export DISPLAY="$selected_display"
+session_key="$(printf '%s' "$DISPLAY" | sha256sum | cut -c1-16)"
+state_dir="${CODEX_IBUS_STATE_ROOT:-$HOME/.local/state/codex-ibus-x11}/sessions/$session_key"
+config_home="$HOME/.config/codex-ibus-x11"
+cache_home="$HOME/.cache/codex-ibus-x11"
+data_home="$HOME/.local/share/codex-ibus-x11"
+env_file="$state_dir/env"
+log_file="$state_dir/ibus-daemon.log"
+dbus_pid_file="$state_dir/dbus.pid"
+ibus_pid_file="$state_dir/ibus.pid"
+default_display="${CODEX_IBUS_DISPLAY:-}"
+
+libpinyin_root="${CODEX_IBUS_LIBPINYIN_ROOT:-$HOME/software/ibus-libpinyin-focal}"
+libpinyin_lib="$libpinyin_root/usr/lib/x86_64-linux-gnu"
+libpinyin_share="$libpinyin_root/usr/share"
+libpinyin_components="$libpinyin_root/usr/share/ibus/component"
+system_components="/usr/share/ibus/component"
+
+ensure_dirs() {
+  mkdir -p "$state_dir" "$config_home" "$cache_home" "$data_home"
+}
+
+is_alive() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1
+}
+
+read_pid() {
+  local file="$1"
+  [[ -r "$file" ]] && sed -n '1p' "$file" || true
+}
+
+path_without() {
+  local remove="$1"
+  local value="${2:-}"
+  local item out=""
+  IFS=':' read -r -a parts <<< "$value"
+  for item in "${parts[@]}"; do
+    [[ -z "$item" || "$item" == "$remove" ]] && continue
+    [[ ":$out:" == *":$item:"* ]] && continue
+    out="${out:+$out:}$item"
+  done
+  printf '%s' "$out"
+}
+
+ibus_bus_glob() {
+  local d="${DISPLAY:-$default_display}"
+  local display_id host
+  if [[ "$d" == :* ]]; then
+    display_id="${d#:}"
+    display_id="${display_id%%.*}"
+    printf '*unix-%s' "$display_id"
+  else
+    host="${d%%:*}"
+    display_id="${d#*:}"
+    display_id="${display_id%%.*}"
+    printf '*%s-%s' "$host" "$display_id"
+  fi
+}
+
+load_env() {
+  local caller_display="${DISPLAY:-}"
+  if [[ -r "$env_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$env_file"
+  fi
+  if [[ -n "$caller_display" ]]; then
+    export DISPLAY="$caller_display"
+  elif [[ -n "${DISPLAY:-}" ]]; then
+    export DISPLAY
+  elif [[ -n "$default_display" ]]; then
+    export DISPLAY="$default_display"
+  else
+    echo "DISPLAY is not set. Export DISPLAY first, for example from your current MobaXterm SSH session." >&2
+    return 1
+  fi
+  export XDG_CONFIG_HOME="$config_home"
+  export XDG_CACHE_HOME="$cache_home"
+  export XDG_DATA_HOME="$data_home"
+  export XMODIFIERS="@im=ibus"
+  export GTK_IM_MODULE="ibus"
+  export QT_IM_MODULE="ibus"
+  export SDL_IM_MODULE="ibus"
+  export LC_CTYPE="${CODEX_IBUS_LC_CTYPE:-zh_CN.UTF-8}"
+  export LD_LIBRARY_PATH="$libpinyin_lib${CODEX_IBUS_EXTRA_LD_LIBRARY_PATH:+:$CODEX_IBUS_EXTRA_LD_LIBRARY_PATH}"
+  export XDG_DATA_DIRS="$libpinyin_share:/usr/local/share:/usr/share"
+  export GSETTINGS_SCHEMA_DIR="$libpinyin_share/glib-2.0/schemas"
+  export IBUS_COMPONENT_PATH="$libpinyin_components:$system_components"
+  # Resolve the actual display-specific daemon, not a global/inherited address.
+  unset IBUS_ADDRESS RESOLVED_IBUS_PID
+  local resolved
+  if resolved="$(/usr/bin/python3 "$tool_root/resolve-session.py" "$DISPLAY" "$config_home/ibus/bus")"; then
+    eval "$resolved"
+  fi
+}
+
+save_env() {
+  umask 077
+  local tmp="$env_file.tmp.$$" name
+  for name in DISPLAY IBUS_ADDRESS DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XMODIFIERS GTK_IM_MODULE QT_IM_MODULE SDL_IM_MODULE LC_CTYPE LD_LIBRARY_PATH XDG_DATA_DIRS GSETTINGS_SCHEMA_DIR IBUS_COMPONENT_PATH; do
+    printf 'export %s=%q\n' "$name" "${!name:-}"
+  done > "$tmp"
+  mv -f "$tmp" "$env_file"
+}
+
+ibus_cmd() {
+  load_env
+  ibus "$@"
+}
+
+set_engine() {
+  local target="$1"
+  local current
+  load_env
+  ibus engine "$target" >/dev/null 2>&1 || true
+  current="$(ibus engine 2>/dev/null || true)"
+  if [[ "$current" == "$target" ]]; then
+    printf '%s\n' "$current"
+    return 0
+  fi
+  echo "Failed to set engine '$target'; current engine is '${current:-<unavailable>}'" >&2
+  return 1
+}
+
+start_session() {
+  ensure_dirs
+  load_env
+
+  local old_ibus="${RESOLVED_IBUS_PID:-}"
+  if [[ -n "$old_ibus" ]] && is_alive "$old_ibus"; then
+    printf '%s\n' "$old_ibus" > "$ibus_pid_file"
+    printf '%s\n' "${DBUS_SESSION_BUS_PID:-}" > "$dbus_pid_file"
+    save_env
+    echo "IBus already running: pid=$old_ibus DISPLAY=$DISPLAY"
+    return 0
+  fi
+
+  local dbus_vars
+  dbus_vars="$(dbus-launch --sh-syntax 9>&-)"
+  eval "$dbus_vars"
+  export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
+  printf '%s\n' "$DBUS_SESSION_BUS_PID" > "$dbus_pid_file"
+  save_env
+
+  : > "$log_file"
+  ibus-daemon \
+    --xim \
+    --replace \
+    --daemonize \
+    --panel="$HOME/tools/ibus-ui-gtk3-wrapper.sh" \
+    --emoji-extension=disable \
+    --config=/usr/libexec/ibus-memconf \
+    --cache=refresh \
+    --verbose 9>&- >>"$log_file" 2>&1
+
+  local pid="" resolved
+  for _ in $(seq 1 50); do
+    if resolved="$(/usr/bin/python3 "$tool_root/resolve-session.py" "$DISPLAY" "$config_home/ibus/bus")"; then
+      eval "$resolved"
+      pid="$RESOLVED_IBUS_PID"
+      printf '%s\n' "$pid" > "$ibus_pid_file"
+      save_env
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ -z "$pid" ]] || ! is_alive "$pid"; then
+    echo "Failed to start private IBus. Log: $log_file" >&2
+    return 1
+  fi
+
+  # Shift toggles Chinese/English inside the pinyin engine; a plain XKB
+  # engine cannot do that. Preserve an existing session's engine above.
+  local initial_engine
+  initial_engine="$(choose_chinese_engine)" || initial_engine=xkb:us::eng
+  set_engine "$initial_engine" >/dev/null
+  echo "Started private IBus: pid=$pid DISPLAY=$DISPLAY"
+}
+
+stop_session() {
+  load_env
+  ibus exit >/dev/null 2>&1 || true
+  local ibus_pid dbus_pid
+  ibus_pid="${RESOLVED_IBUS_PID:-}"
+  dbus_pid="$(read_pid "$dbus_pid_file")"
+  if is_alive "$ibus_pid"; then
+    kill "$ibus_pid" >/dev/null 2>&1 || true
+  fi
+  if is_alive "$dbus_pid"; then
+    kill "$dbus_pid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$ibus_pid_file" "$dbus_pid_file" "$env_file"
+  echo "Stopped private IBus session"
+}
+
+status_session() {
+  load_env
+  local ibus_pid dbus_pid
+  ibus_pid="${RESOLVED_IBUS_PID:-}"
+  dbus_pid="$(read_pid "$dbus_pid_file")"
+  echo "DISPLAY=$DISPLAY"
+  echo "IBUS_ADDRESS=${IBUS_ADDRESS:-}"
+  echo "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-}"
+  echo "IBus PID=$ibus_pid alive=$(is_alive "$ibus_pid" && echo yes || echo no)"
+  echo "DBus PID=$dbus_pid alive=$(is_alive "$dbus_pid" && echo yes || echo no)"
+  echo -n "Current engine: "
+  ibus engine 2>/dev/null || echo "<unavailable>"
+}
+
+choose_chinese_engine() {
+  load_env
+  if ibus list-engine | awk '{print $1}' | grep -qx 'libpinyin'; then
+    echo "libpinyin"
+  elif ibus list-engine | awk '{print $1}' | grep -qx 'libbopomofo'; then
+    echo "libbopomofo"
+  elif ibus list-engine | awk '{print $1}' | grep -qx 'pinyin'; then
+    echo "pinyin"
+  else
+    return 1
+  fi
+}
+
+start_session_locked() {
+  ensure_dirs
+  (flock -x 9; start_session) 9>"$state_dir/session.lock"
+}
+
+case "${1:-status}" in
+  run)
+    shift
+    [[ $# -gt 0 ]] || { echo "Usage: ibus-x11 run COMMAND [ARGS...]" >&2; exit 2; }
+    start_session_locked >/dev/null
+    load_env
+    exec "$@"
+    ;;
+  start)
+    start_session_locked
+    ;;
+  restart)
+    stop_session
+    start_session_locked
+    ;;
+  stop)
+    stop_session
+    ;;
+  status)
+    status_session
+    ;;
+  list)
+    ibus_cmd list-engine
+    ;;
+  engine)
+    if [[ $# -ge 2 ]]; then
+      set_engine "$2"
+    else
+      ibus_cmd engine
+    fi
+    ;;
+  en)
+    set_engine xkb:us::eng
+    ;;
+  cn)
+    engine="$(choose_chinese_engine)" || {
+      echo "No Chinese IBus engine found" >&2
+      exit 1
+    }
+    set_engine "$engine"
+    ;;
+  env)
+    load_env
+    save_env
+    sed -n '1,200p' "$env_file"
+    ;;
+  log)
+    tail -n "${2:-80}" "$log_file"
+    ;;
+  *)
+    echo "Usage: $0 {start|restart|stop|status|list|engine ENGINE|en|cn|env|log [N]}" >&2
+    exit 2
+    ;;
+esac

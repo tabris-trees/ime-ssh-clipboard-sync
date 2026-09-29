@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec /usr/bin/python3 "$HOME/tools/clipboard-x11/clipboard-x11.py" read-files "$@"
