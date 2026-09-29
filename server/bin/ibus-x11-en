@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-exec "$HOME/tools/codex-ibus-x11/ibus-x11" en
+exec /usr/bin/python3 "$HOME/tools/codex-ibus-x11/ssh-dispatch.py" en "$@"

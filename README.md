@@ -20,7 +20,8 @@
 - Windows OpenSSH 的 `ssh.exe` 与 `scp.exe`。
 - SSH 密钥登录：目标地址和端口由未提交的 `config.psd1` 配置。
 - 远端 X11 会话和约定的稳定 API 已可用。
-- Windows 端需要有可从远端访问的 X Server（默认显示号 `:0.0`）。脚本会在远端通过 `SSH_CONNECTION` 动态取得当前 Windows 客户端 IP，因此不依赖固定 IP，也不依赖 Quicker 继承 `DISPLAY`。
+- Windows 端需要有可从远端访问的 X Server。Windows 脚本无需继承或构造 `DISPLAY`。
+- 新版服务端会根据 SSH 来源选择对应的活动 X11/IBus 会话；Windows 不再拼接固定客户端 IP。只有服务器报告候选会话不唯一时，才在 `config.psd1` 中填写 `RemoteDisplay`。
 
 ## 一键启动
 
@@ -34,6 +35,8 @@ notepad .\config.psd1
 双击 `start-hidden.vbs`。它会隐藏启动 IME 与剪贴板两个进程。两个进程都有用户级互斥锁，重复双击不会产生重复实例。
 
 启动后，按一次 `Ctrl+Shift+S` 切换一次远端输入法。按住快捷键不会连续触发；本地微软拼音状态不会被读取，也不会触发远端切换。进程每次启动后的第一次按键固定切到远端中文，后续按键在中文/英文之间交替。该组合键是 Windows 全局快捷键，会覆盖前台应用原本的 `Ctrl+Shift+S` 功能。
+
+每次远端切换请求最长等待 12 秒；失败时最多重试 3 次，重试间隔 1.5 秒。只有服务端确认成功后，下一次快捷键才会切换到相反状态。
 
 Quicker 用户请导入 `Quicker_切换IME与剪贴板同步_公共目录版.json`。
 
@@ -99,6 +102,8 @@ ssh -p XXX XXX@XXX true
 - 根目录：Windows PowerShell、VBS 启动器、Quicker 动作和管理脚本。
 - `server/clipboard-x11.py`：Linux X11 剪贴板实现。
 - `server/ibus-x11`：Linux 私有 IBus 会话实现。
+- `server/ssh-dispatch.py`：依据 `SSH_CONNECTION` 和活动 IBus 进程选择对应 X11 会话。
+- `server/resolve-session.py`：验证并解析显示会话对应的 IBus daemon。
 - `server/bin/`：当前部署的稳定 API 包装脚本。
 
 `server/` 保存服务端实现，用户目录通过 `$HOME` 或 `Path.home()` 动态定位。部署前请确认 Python 依赖 Pillow、python-xlib，以及 `xclip`、IBus、D-Bus 和 X11 环境可用。

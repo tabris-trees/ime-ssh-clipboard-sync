@@ -80,6 +80,10 @@ $sshExe = (Get-Command ssh.exe -ErrorAction Stop).Source
 $sshTarget = [string]$config.SshTarget
 $sshPort = [string]$config.SshPort
 $remoteBin = ([string]$config.RemoteBin).TrimEnd('/')
+$remoteDisplay = [string]$config.RemoteDisplay
+if ($remoteDisplay -and $remoteDisplay -notmatch '^[A-Za-z0-9_.-]*:[0-9]+(\.[0-9]+)?$') {
+    throw 'RemoteDisplay must be an X11 DISPLAY such as localhost:10.0'
+}
 $remoteScripts = @{
     CN = "$remoteBin/ibus-x11-cn"
     EN = "$remoteBin/ibus-x11-en"
@@ -117,20 +121,34 @@ function Show-State([string]$State, [string]$RemoteState) {
 }
 
 function Invoke-RemoteState([string]$State) {
-    # Background processes do not inherit MobaXterm's DISPLAY. Derive the
-    # Windows SSH client address on the remote side and target its X server :0.0.
-    $sshArguments = "-p $sshPort -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 $sshTarget " + 'DISPLAY=${SSH_CONNECTION%% *}:0.0 ' + $remoteScripts[$State]
-    $psi = [System.Diagnostics.ProcessStartInfo]::new($sshExe, $sshArguments)
+    # The server selects the matching X11/IBus session from the SSH source.
+    # RemoteDisplay is only an explicit override for ambiguous multi-session cases.
+    $remoteCommand = $remoteScripts[$State]
+    if ($remoteDisplay) { $remoteCommand += " --display $remoteDisplay" }
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $sshExe
+    foreach ($argument in @('-T', '-p', $sshPort, '-o', 'BatchMode=yes',
+            '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=5',
+            '-o', 'ServerAliveCountMax=1', $sshTarget, $remoteCommand)) {
+        [void]$psi.ArgumentList.Add($argument)
+    }
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $psi.RedirectStandardInput = $true
     $psi.CreateNoWindow = $true
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $psi
     [void]$process.Start()
-    $stdout = $process.StandardOutput.ReadToEnd().Trim()
-    $stderr = $process.StandardError.ReadToEnd().Trim()
-    $process.WaitForExit()
+    $process.StandardInput.Close()
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit(12000)) {
+        try { $process.Kill($true) } catch {}
+        throw 'SSH IME switch timed out after 12 seconds'
+    }
+    $stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
+    $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
 
     if ($process.ExitCode -ne 0) {
         throw "ssh exit=$($process.ExitCode): $stderr"
@@ -151,7 +169,18 @@ function Switch-RemoteIme {
     $runtime.Busy = $true
     $state = $runtime.NextState
     try {
-        $remoteState = Invoke-RemoteState $state
+        $remoteState = $null
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                $remoteState = Invoke-RemoteState $state
+                break
+            }
+            catch {
+                Write-Log "hotkey retry state=$state attempt=$attempt error=$($_.Exception.Message)"
+                if ($attempt -eq 3) { throw }
+                Start-Sleep -Milliseconds 1500
+            }
+        }
         $runtime.NextState = if ($state -eq 'CN') { 'EN' } else { 'CN' }
         Write-Log "hotkey switched=$state remote=$remoteState next=$($runtime.NextState)"
         Show-State $state $remoteState
