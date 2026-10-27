@@ -1,8 +1,8 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$NoBalloon,
     [switch]$Once,
-    [ValidateSet('CN', 'EN')]
+    [ValidateSet('CN', 'EN', 'MSIME')]
     [string]$InitialState = 'CN'
 )
 
@@ -85,8 +85,9 @@ if ($remoteDisplay -and $remoteDisplay -notmatch '^[A-Za-z0-9_.-]*:[0-9]+(\.[0-9
     throw 'RemoteDisplay must be an X11 DISPLAY such as localhost:10.0'
 }
 $remoteScripts = @{
-    CN = "$remoteBin/ibus-x11-cn"
+    CN = "$remoteBin/ibus-x11-pinyin"
     EN = "$remoteBin/ibus-x11-en"
+    MSIME = "$remoteBin/ibus-x11-msime"
 }
 
 $logDir = Join-Path $env:LOCALAPPDATA 'ImeSshSync'
@@ -113,7 +114,7 @@ if (-not $NoBalloon) {
 
 function Show-State([string]$State, [string]$RemoteState) {
     if ($null -eq $notifyIcon) { return }
-    $displayState = if ($State -eq 'CN') { '中文' } else { '英文' }
+    $displayState = @{ CN = '中文（libpinyin）'; EN = '英文'; MSIME = '中文（水杉 MSIME）' }[$State]
     $notifyIcon.BalloonTipTitle = "远端输入法已切换：$displayState"
     $notifyIcon.BalloonTipText = "远端输入引擎：$RemoteState"
     $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
@@ -181,7 +182,7 @@ function Switch-RemoteIme {
                 Start-Sleep -Milliseconds 1500
             }
         }
-        $runtime.NextState = if ($state -eq 'CN') { 'EN' } else { 'CN' }
+        $runtime.NextState = @{ CN = 'EN'; EN = 'MSIME'; MSIME = 'CN' }[$state]
         Write-Log "hotkey switched=$state remote=$remoteState next=$($runtime.NextState)"
         Show-State $state $remoteState
     }

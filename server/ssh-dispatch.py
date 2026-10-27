@@ -11,14 +11,20 @@ spec = importlib.util.spec_from_file_location('resolver', ROOT / 'resolve-sessio
 resolver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(resolver)
 CONFIG = Path.home() / '.config/codex-ibus-x11'
+APP_ROOT = Path(os.environ.get(
+    'CODEX_DESKTOP_ROOT',
+    str(Path.home() / 'software/codex-desktop-linux/codex-app'),
+))
 
-def select_display(explicit, peer, sessions):
+def select_display(explicit, peer, sessions, app_sessions=()):
     if explicit:
         matches = {d for d, _ in sessions if d == explicit}
     elif peer:
-        # A direct X server address is stronger evidence than a historical SSH
-        # origin (one client may also have an old forwarded display).
-        matches = {d for d, _ in sessions if d.rsplit(':', 1)[0] == peer}
+        live = {d for d, _ in sessions}
+        # An active application's connection is stronger evidence than old daemons.
+        matches = {d for d, origin in app_sessions if origin == peer and d in live}
+        if not matches:
+            matches = {d for d, _ in sessions if d.rsplit(':', 1)[0] == peer}
         if not matches:
             matches = {d for d, origin in sessions if origin == peer}
     else:
@@ -49,19 +55,53 @@ def live_sessions():
             continue
     return sessions
 
+def active_codex_sessions():
+    sessions = set()
+    app_root = APP_ROOT
+    for proc in Path('/proc').glob('[0-9]*'):
+        try:
+            if proc.stat().st_uid != os.getuid():
+                continue
+            if (proc/'exe').resolve() != app_root/'resources/codex':
+                continue
+            args = (proc/'cmdline').read_bytes().split(b'\0')
+            if b'app-server' not in args:
+                continue
+            # Only the desktop's backend, not a standalone CLI app-server.
+            parent = proc
+            desktop_parent = False
+            for _ in range(6):
+                fields = dict(line.split(':', 1) for line in (parent/'status').read_text().splitlines() if ':' in line)
+                parent = Path('/proc')/fields['PPid'].strip()
+                if (parent/'exe').resolve() == app_root/'ChatGPT':
+                    desktop_parent = True
+                    break
+                if parent.name in ('0', '1'):
+                    break
+            if not desktop_parent:
+                continue
+            env = dict(x.split('=', 1) for x in (proc/'environ').read_text().split('\0') if '=' in x)
+            origin = env.get('SSH_CONNECTION', '').split()
+            if origin and env.get('DISPLAY') and env.get('XDG_CONFIG_HOME') == str(CONFIG):
+                sessions.add((env['DISPLAY'], origin[0]))
+        except (OSError, UnicodeError, KeyError):
+            continue
+    return sessions
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['cn', 'en', 'status'])
+    parser.add_argument('mode', choices=['cn', 'en', 'status', 'pinyin', 'msime'])
     parser.add_argument('--display', default='')
     args = parser.parse_args()
     connection = os.environ.get('SSH_CONNECTION', '').split()
     try:
         display = select_display(args.display or os.environ.get('DISPLAY') or os.environ.get('CODEX_IBUS_DISPLAY'),
-                                 connection[0] if connection else '', live_sessions())
+                                 connection[0] if connection else '', live_sessions(), active_codex_sessions())
     except ValueError as error:
         sys.exit(str(error))
     os.environ['DISPLAY'] = display
-    os.execv(str(ROOT/'ibus-x11'), [str(ROOT/'ibus-x11'), args.mode])
+    command = ['engine', {'pinyin': 'libpinyin', 'msime': 'msime-linux'}[args.mode]] if args.mode in ('pinyin', 'msime') else [args.mode]
+    os.execv(str(ROOT/'ibus-x11'), [str(ROOT/'ibus-x11'), *command])
 
 if __name__ == '__main__':
     main()

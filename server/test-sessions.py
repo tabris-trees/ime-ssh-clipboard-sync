@@ -23,6 +23,8 @@ class Sessions(unittest.TestCase):
             tool = root / 'ibus-x11'
             tool.write_text(Path(IBUS).read_text().replace('tool_root="$HOME/tools/codex-ibus-x11"', 'tool_root="' + tmp + '"'))
             tool.chmod(0o700)
+            (root / 'ibus').write_text('#!/bin/sh\necho libpinyin\n')
+            (root / 'ibus').chmod(0o700)
             (root / 'resolve-session.py').write_text("import hashlib,os,sys; key=hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16]; print('export RESOLVED_IBUS_PID='+os.environ['TEST_DAEMON_PID']); print('export IBUS_ADDRESS=unix:test-'+key); print('export DBUS_SESSION_BUS_ADDRESS=test:'+key); print('export DBUS_SESSION_BUS_PID='+os.environ['TEST_DAEMON_PID'])")
             Path(tmp, 'env').write_text("export DISPLAY='old.invalid:0'\n")
             for display in ['localhost:10.0', 'localhost:11.0']:
@@ -31,7 +33,7 @@ class Sessions(unittest.TestCase):
                 state.mkdir(parents=True)
                 (state / 'ibus.pid').write_text(str(os.getpid()))
                 (state / 'env').write_text("export DISPLAY='wrong.invalid:0'\nexport DBUS_SESSION_BUS_ADDRESS='test:" + key + "'\n")
-                env = dict(os.environ, DISPLAY=display, CODEX_IBUS_STATE_ROOT=tmp, TEST_DAEMON_PID=str(os.getpid()))
+                env = dict(os.environ, DISPLAY=display, CODEX_IBUS_STATE_ROOT=tmp, TEST_DAEMON_PID=str(os.getpid()), PATH=tmp+":"+os.environ["PATH"])
                 result = subprocess.run([str(tool), 'run', '/usr/bin/python3', '-c', 'import os,json; print(json.dumps([os.environ["DISPLAY"],os.environ["DBUS_SESSION_BUS_ADDRESS"]]))'], env=env, capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout), [display, 'test:' + key])

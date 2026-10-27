@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 $configPath = Join-Path $PSScriptRoot 'config.psd1'
@@ -28,6 +28,13 @@ if ($processes) {
 else {
     Write-Host 'No local ImeSshSync processes are running.'
 }
+
+Write-Host "`nRemote IME status:"
+$remoteDisplay = [string]$config.RemoteDisplay
+if ($remoteDisplay -and $remoteDisplay -notmatch '^[A-Za-z0-9_.-]*:[0-9]+(\.[0-9]+)?$') { throw 'Invalid RemoteDisplay' }
+$imeCommand = "$remoteBin/ibus-x11-status"
+if ($remoteDisplay) { $imeCommand += " --display $remoteDisplay" }
+& ssh.exe -T -p $sshPort -o BatchMode=yes -o ConnectTimeout=8 $sshTarget $imeCommand
 
 Write-Host "`nRemote clipboard status:"
 & ssh.exe -T -p $sshPort -o BatchMode=yes -o ConnectTimeout=8 $sshTarget ('DISPLAY=${SSH_CONNECTION%% *}:0.0 ' + "$remoteBin/clipboard-x11-status")

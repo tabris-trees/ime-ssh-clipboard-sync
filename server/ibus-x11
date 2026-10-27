@@ -21,6 +21,7 @@ ibus_pid_file="$state_dir/ibus.pid"
 default_display="${CODEX_IBUS_DISPLAY:-}"
 
 libpinyin_root="${CODEX_IBUS_LIBPINYIN_ROOT:-$HOME/software/ibus-libpinyin-focal}"
+msime_root="${MSIME_ROOT:-$HOME/software/msime}"
 libpinyin_lib="$libpinyin_root/usr/lib/x86_64-linux-gnu"
 libpinyin_share="$libpinyin_root/usr/share"
 libpinyin_components="$libpinyin_root/usr/share/ibus/component"
@@ -93,7 +94,7 @@ load_env() {
   export SDL_IM_MODULE="ibus"
   export LC_CTYPE="${CODEX_IBUS_LC_CTYPE:-zh_CN.UTF-8}"
   export LD_LIBRARY_PATH="$libpinyin_lib${CODEX_IBUS_EXTRA_LD_LIBRARY_PATH:+:$CODEX_IBUS_EXTRA_LD_LIBRARY_PATH}"
-  export XDG_DATA_DIRS="$libpinyin_share:/usr/local/share:/usr/share"
+  export XDG_DATA_DIRS="$msime_root/share:$libpinyin_share:/usr/local/share:/usr/share"
   export GSETTINGS_SCHEMA_DIR="$libpinyin_share/glib-2.0/schemas"
   export IBUS_COMPONENT_PATH="$libpinyin_components:$system_components"
   # Resolve the actual display-specific daemon, not a global/inherited address.
@@ -122,13 +123,59 @@ set_engine() {
   local target="$1"
   local current
   load_env
+  local previous
+  previous="$(ibus engine 2>/dev/null || true)"
+  case "$previous" in
+    libpinyin|msime-linux)
+      ensure_dirs
+      printf '%s\n' "$previous" > "$state_dir/chinese-engine.tmp.$$"
+      mv -f "$state_dir/chinese-engine.tmp.$$" "$state_dir/chinese-engine"
+      ;;
+  esac
   ibus engine "$target" >/dev/null 2>&1 || true
   current="$(ibus engine 2>/dev/null || true)"
   if [[ "$current" == "$target" ]]; then
+    case "$target" in
+      libpinyin|msime-linux)
+        ensure_dirs
+        printf '%s\n' "$target" > "$state_dir/chinese-engine.tmp.$$"
+        mv -f "$state_dir/chinese-engine.tmp.$$" "$state_dir/chinese-engine"
+        ;;
+    esac
     printf '%s\n' "$current"
     return 0
   fi
   echo "Failed to set engine '$target'; current engine is '${current:-<unavailable>}'" >&2
+  return 1
+}
+
+prepare_integrations() {
+  if [[ -f "$tool_root/ensure-msime.py" ]]; then
+    # Close the startup lock before Python starts persistent child processes.
+    timeout 15 /usr/bin/python3 "$tool_root/ensure-msime.py" 9>&- >>"$state_dir/integration.log" 2>&1 ||
+      echo "Warning: MSIME/panel setup failed; see $state_dir/integration.log" >&2
+  fi
+}
+
+initialize_engine() {
+  local initial_engine fallback attempt
+  initial_engine="$(choose_chinese_engine)" || initial_engine=xkb:us::eng
+  # Registration and engine construction may finish after the daemon is ready.
+  for attempt in 1 2 3 4 5; do
+    if set_engine "$initial_engine" >>"$state_dir/integration.log" 2>&1; then
+      return 0
+    fi
+    sleep 0.3
+  done
+  # A slow optional engine must not prevent launching the application. Do not
+  # replace the remembered Chinese preference when using a temporary fallback.
+  for fallback in libpinyin xkb:us::eng; do
+    if ibus engine "$fallback" >>"$state_dir/integration.log" 2>&1; then
+      echo "Warning: '$initial_engine' was not ready; using '$fallback' for this launch." >&2
+      return 0
+    fi
+  done
+  echo "IBus could not activate any input engine. See $state_dir/integration.log" >&2
   return 1
 }
 
@@ -141,6 +188,10 @@ start_session() {
     printf '%s\n' "$old_ibus" > "$ibus_pid_file"
     printf '%s\n' "${DBUS_SESSION_BUS_PID:-}" > "$dbus_pid_file"
     save_env
+    prepare_integrations
+    if ! ibus engine >/dev/null 2>&1; then
+      initialize_engine
+    fi
     echo "IBus already running: pid=$old_ibus DISPLAY=$DISPLAY"
     return 0
   fi
@@ -179,11 +230,8 @@ start_session() {
     return 1
   fi
 
-  # Shift toggles Chinese/English inside the pinyin engine; a plain XKB
-  # engine cannot do that. Preserve an existing session's engine above.
-  local initial_engine
-  initial_engine="$(choose_chinese_engine)" || initial_engine=xkb:us::eng
-  set_engine "$initial_engine" >/dev/null
+  prepare_integrations
+  initialize_engine
   echo "Started private IBus: pid=$pid DISPLAY=$DISPLAY"
 }
 
@@ -219,6 +267,17 @@ status_session() {
 
 choose_chinese_engine() {
   load_env
+  local current preferred
+  current="$(ibus engine 2>/dev/null || true)"
+  case "$current" in libpinyin|msime-linux) echo "$current"; return 0 ;; esac
+  preferred="$(read_pid "$state_dir/chinese-engine")"
+  case "$preferred" in
+    libpinyin|msime-linux)
+      if ibus list-engine | awk '{print $1}' | grep -qx "$preferred"; then
+        echo "$preferred"; return 0
+      fi
+      ;;
+  esac
   if ibus list-engine | awk '{print $1}' | grep -qx 'libpinyin'; then
     echo "libpinyin"
   elif ibus list-engine | awk '{print $1}' | grep -qx 'libbopomofo'; then

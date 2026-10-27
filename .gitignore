@@ -16,3 +16,4 @@ Thumbs.db
 .idea/
 __pycache__/
 *.pyc
+.backup.md

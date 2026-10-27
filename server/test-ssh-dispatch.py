@@ -5,6 +5,13 @@ import unittest
 select = runpy.run_path(str(Path(__file__).resolve().parent / 'ssh-dispatch.py'))['select_display']
 
 class Routing(unittest.TestCase):
+    def test_active_codex_overrides_old_direct_display(self):
+        sessions = [('192.0.2.10:0.0','192.0.2.10'), ('127.0.0.1:100.0','192.0.2.10')]
+        self.assertEqual(select('', '192.0.2.10', sessions, [('127.0.0.1:100.0','192.0.2.10')]), '127.0.0.1:100.0')
+        with self.assertRaises(ValueError):
+            select('', '192.0.2.10', sessions, sessions)
+        self.assertEqual(select('192.0.2.10:0.0', '192.0.2.10', sessions, [('127.0.0.1:100.0','192.0.2.10')]), '192.0.2.10:0.0')
+
     def test_direct_address_beats_old_forward(self):
         self.assertEqual(select('', '192.0.2.10', [('192.0.2.10:0.0','192.0.2.10'), ('localhost:10.0','192.0.2.10')]), '192.0.2.10:0.0')
     def test_forwarded_session_uses_ssh_origin(self):

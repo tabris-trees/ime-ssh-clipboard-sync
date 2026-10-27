@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec /usr/bin/python3 "$HOME/tools/codex-ibus-x11/ssh-dispatch.py" msime "$@"
